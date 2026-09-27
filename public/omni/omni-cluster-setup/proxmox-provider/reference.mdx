@@ -1,0 +1,150 @@
+---
+title: Reference
+description: Reference guide to the Proxmox Infrastructure Provider — command-line flags, configuration file, and machine class schema.
+---
+
+## `omni-infra-provider-proxmox`
+
+Provision Talos Linux VMs on Proxmox VE in response to Omni machine requests.
+
+```
+omni-infra-provider-proxmox [flags]
+```
+
+### Options
+
+```
+      --config-file string              Proxmox provider config
+      --id string                       the id of the infra provider, it is used to match the resources with the infra provider label. (default "proxmox")
+      --insecure-skip-verify            ignores untrusted certs on Omni side
+      --omni-api-endpoint string        the endpoint of the Omni API, if not set, defaults to OMNI_ENDPOINT env var.
+      --omni-service-account-key string Omni service account key, if not set, defaults to OMNI_SERVICE_ACCOUNT_KEY.
+      --provider-description string     Provider description as it appears in Omni (default "Proxmox infrastructure provider")
+      --provider-name string            provider name as it appears in Omni (default "Proxmox")
+  -h, --help                            help for omni-infra-provider-proxmox
+```
+
+<Warning>`--insecure-skip-verify` only affects the connection to the Omni API. To skip TLS verification for Proxmox, use `proxmox.insecureSkipVerify` in the configuration file.</Warning>
+
+## Configuration file
+
+The file passed via `--config-file` is a YAML document with a single top-level `proxmox` object. Exactly one authentication pair must be set: either `tokenID` + `tokenSecret`, or `username` + `password` + `realm`. If both are set, the password pair wins.
+
+| Field                        | Type   | Description                                                                                                                                          |
+|:-----------------------------|:-------|:-----------------------------------------------------------------------------------------------------------------------------------------------------|
+| `proxmox.url`                | string | **Required.** Proxmox VE API URL, including the `/api2/json` path. Example: `https://pve.example.com:8006/api2/json`.                                |
+| `proxmox.tokenID`            | string | **Required for token auth.** Proxmox API token ID, such as `omni-provider@pve!omni`.                                                                 |
+| `proxmox.tokenSecret`        | string | **Required for token auth.** Proxmox API token secret (UUID).                                                                                        |
+| `proxmox.username`           | string | **Required for password auth.** Proxmox user.                                                                                                        |
+| `proxmox.password`           | string | **Required for password auth.** Password for the user.                                                                                               |
+| `proxmox.realm`              | string | **Required for password auth.** Authentication realm, for example `pam` or `pve`. No default is applied.                                             |
+| `proxmox.insecureSkipVerify` | bool   | Skip TLS verification on the Proxmox side.<br/>**Default:** `false`                                                                                  |
+
+## Machine class schema
+
+The machine class's `spec.autoProvision.providerData` field is a YAML document validated against [this JSON schema](https://github.com/siderolabs/omni-infra-provider-proxmox/blob/main/cmd/omni-infra-provider-proxmox/data/schema.json). Four fields are required: `cores`, `memory`, `disk_size`, and `storage_selector`.
+
+### Compute and topology
+
+| Field           | Type    | Description                                                                                                                                                                                                            |
+|:----------------|:--------|:-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `cores`         | integer | **Required.** Number of CPU cores per socket. Minimum: `1`.                                                                                                                                                            |
+| `memory`        | integer | **Required.** Memory in MB. Minimum: `2048`.                                                                                                                                                                           |
+| `sockets`       | integer | Number of CPU sockets. Minimum: `1`.<br/>**Default:** `1`                                                                                                                                                              |
+| `cpu_type`      | string  | QEMU CPU type. Use `host` for HPC or GPU pass-through when source and target CPUs match.<br/>**Default:** `x86-64-v2-AES`                                                                                              |
+| `machine_type`  | string  | QEMU machine type. One of `q35`, `i440fx`. `q35` is required for native PCI Express support (GPU pass-through).<br/>**Default:** `i440fx`                                                                              |
+| `numa`          | bool    | Enable NUMA topology for better memory locality on multi-socket hosts.<br/>**Default:** `false`                                                                                                                        |
+| `hugepages`     | string  | Back VM memory with huge pages. One of `2MB`, `1GB`. Use `1GB` for GPU or HPC workloads.                                                                                                                               |
+| `balloon`       | bool    | Memory ballooning. The provider only sets `balloon=0` when this is explicitly `false`. Set to `false` when using GPU pass-through or huge pages.<br/>**Default:** unset (Proxmox default: on)                          |
+
+### Placement
+
+| Field              | Type   | Description                                                                                                                                                                                                                |
+|:-------------------|:-------|:---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `node`             | string | Pin the VM to a specific Proxmox node. When unset, the provider auto-selects one (see [Node selection](./overview#node-selection) in the overview).                                                                        |
+| `storage_selector` | string | **Required.** CEL expression selecting the Proxmox storage pool for VM disks. Must evaluate to exactly one storage on the chosen node. See variables list below.                                                           |
+
+Variables exposed to the `storage_selector` CEL expression:
+
+| Variable          | Type   | Meaning                                                                                                          |
+|:------------------|:-------|:-----------------------------------------------------------------------------------------------------------------|
+| `name`            | string | Storage identifier.                                                                                              |
+| `node`            | string | Name of the Proxmox node the storage is evaluated on (distinct from the `node` field above, which pins the VM).  |
+| `storageType`     | string | Storage driver (`lvmthin`, `rbd`, `zfspool`, `nfs`, `dir`, …).                                                   |
+| `availableSpace`  | uint   | Free space in bytes.                                                                                             |
+
+See the [setup tutorial](./setup) for example expressions.
+
+### Primary disk
+
+Attached as `scsi0`.
+
+| Field           | Type    | Description                                                                                                                                    |
+|:----------------|:--------|:-----------------------------------------------------------------------------------------------------------------------------------------------|
+| `disk_size`     | integer | **Required.** Size of the root disk, in GB. Minimum: `5`.                                                                                      |
+| `disk_ssd`      | bool    | Enable SSD emulation (`ssd=1`). Recommended on SSD or NVMe storage.<br/>**Default:** `false`                                                   |
+| `disk_discard`  | bool    | Enable TRIM/discard (`discard=on`). Required for thin-provisioned storage to reclaim space.<br/>**Default:** `false`                           |
+| `disk_iothread` | bool    | Enable a dedicated IO thread (`iothread=1`). Improves disk throughput under load.<br/>**Default:** `false`                                     |
+| `disk_cache`    | string  | QEMU disk cache mode. One of `none`, `writethrough`, `writeback`, `directsync`, `unsafe`. `none` is recommended for battery-backed storage.    |
+| `disk_aio`      | string  | Asynchronous IO mode. One of `native`, `threads`, `io_uring`. `io_uring` gives the best performance on modern kernels.                         |
+
+### Additional disks
+
+Each entry in `additional_disks` adds a `scsiN` disk (starting at `scsi1`).
+
+```yaml
+additional_disks:
+  - disk_size: 200
+    storage_selector: 'name == "ceph-data"'
+    disk_ssd: true
+    disk_discard: true
+    disk_iothread: true
+    disk_cache: none
+    disk_aio: io_uring
+```
+
+| Field                                                                 | Type    | Description                                                                                     |
+|:----------------------------------------------------------------------|:--------|:------------------------------------------------------------------------------------------------|
+| `disk_size`                                                           | integer | **Required.** Size in GB. Minimum: `1`.                                                         |
+| `storage_selector`                                                    | string  | **Required.** CEL expression for the storage pool. Can differ from the primary disk.            |
+| `disk_ssd`, `disk_discard`, `disk_iothread`, `disk_cache`, `disk_aio` | —       | Same semantics as on the primary disk.                                                          |
+
+### Networking
+
+The primary NIC (`net0`) is a `virtio` interface with the Proxmox firewall always enabled (see [Fixed VM settings](./overview#fixed-vm-settings) in the overview).
+
+| Field            | Type    | Description                                                                                                                 |
+|:-----------------|:--------|:----------------------------------------------------------------------------------------------------------------------------|
+| `network_bridge` | string  | Name of the Proxmox bridge for `net0`. The bridge must exist on the chosen node.<br/>**Default:** `vmbr0`                   |
+| `vlan`           | integer | VLAN tag for `net0`. `0` means untagged. Minimum: `0`.<br/>**Default:** `0`                                                 |
+
+Additional NICs are declared via `additional_nics`.
+
+| Field      | Type    | Description                                                                                  |
+|:-----------|:--------|:---------------------------------------------------------------------------------------------|
+| `bridge`   | string  | **Required.** Proxmox bridge name for the additional NIC.                                    |
+| `vlan`     | integer | VLAN tag. `0` means untagged. Minimum: `0`.<br/>**Default:** `0`                             |
+| `firewall` | bool    | Enable the Proxmox firewall for this NIC.<br/>**Default:** `false`                           |
+
+### PCI pass-through
+
+PCI pass-through devices are declared via Proxmox [Resource Mappings](https://pve.proxmox.com/wiki/Resource_Mapping). Create the mapping in Proxmox first (**Datacenter** > **Resource Mappings**), then reference it from `pci_devices`.
+
+```yaml
+pci_devices:
+  - mapping: nvidia-l40s
+    pcie: true
+    primary_gpu: true
+    rombar: true
+```
+
+| Field         | Type   | Description                                                                                               |
+|:--------------|:-------|:----------------------------------------------------------------------------------------------------------|
+| `mapping`     | string | **Required.** Name of the Proxmox Resource Mapping.                                                       |
+| `mdev`        | string | Proxmox Mediated Device name (for example `nvidia-180`) when sharing a device.                            |
+| `pcie`        | bool   | Use PCI Express mode (`pcie=1`). Recommended for GPUs on `q35` machines.<br/>**Default:** `false`         |
+| `primary_gpu` | bool   | Mark as the primary GPU (`x-vga=1`) for console output.<br/>**Default:** `false`                          |
+| `rombar`      | bool   | Expose the ROM BAR of the device.<br/>**Default:** `false`                                                |
+
+When attaching PCI devices, set `machine_type: q35`, `balloon: false`, and `hugepages: 1GB` for best results.
+

@@ -1,0 +1,424 @@
+---
+title: Setup
+description: Deploy and configure the Proxmox Infrastructure Provider to automatically provision and manage Talos Linux VMs on a Proxmox VE cluster with Omni.
+---
+
+In this tutorial, we will set up the [Proxmox Infrastructure Provider](https://github.com/siderolabs/omni-infra-provider-proxmox) for our Omni instance and validate it with a small test cluster. For background on how the provider works, read the [overview](./overview) first.
+
+We will assume the following environment; adjust the values to your own deployment:
+
+* Omni instance: `https://my-instance.omni.siderolabs.io`
+* Proxmox VE API: `https://pve.example.com:8006/`
+* A dedicated Docker host running the provider container, separate from the Proxmox nodes
+
+## Requirements
+
+* An Omni instance (Sidero Labs SaaS or self-hosted) with Admin access.
+* A Proxmox VE cluster (or single host). The Proxmox nodes must reach [Image Factory](https://factory.talos.dev) (or a self-hosted one), because the ISO download runs on the Proxmox side through the storage API.
+* Proxmox credentials with permissions to manage VMs and storage. An API token is recommended; user/password is also supported.
+* A trusted TLS certificate on the Proxmox Web API (recommended for production).
+* A host with Docker, or a Kubernetes cluster, that can reach both the Proxmox VE API (default port `8006/tcp`) and the Omni API.
+* Outbound connectivity from the provisioned VMs to the Omni instance (for SideroLink).
+
+## 1. Creating an Omni infra provider
+
+Create the infra provider identity the provider will use to authenticate against Omni. This is **not** a regular Omni service account — it is an infra provider key, issued through a dedicated flow, and the two are not interchangeable.
+
+<Info>
+The infra provider ID must match the value of the provider's `--id` flag, which defaults to `proxmox`. If you plan to change it or run multiple Proxmox providers in parallel, set both values consistently.
+</Info>
+
+<Tabs>
+  <Tab title="From Omni Web UI">
+    Navigate to **Settings** > **Infra Providers** in the Omni web UI and create a new infra provider with ID `proxmox`.
+
+    Store the displayed service account key securely for later use.
+  </Tab>
+
+  <Tab title="Using omnictl">
+    With `omnictl` configured against your Omni instance, run:
+
+    ```bash
+    omnictl infraprovider create proxmox
+    ```
+
+    The command prints the Omni endpoint and the infra provider key:
+
+    ```
+    OMNI_ENDPOINT=https://my-instance.omni.siderolabs.io
+    OMNI_SERVICE_ACCOUNT_KEY=eyJu...LS0ifQ==
+    ```
+
+    Store them safely for later use.
+  </Tab>
+</Tabs>
+
+<Info>
+The environment variable name is `OMNI_SERVICE_ACCOUNT_KEY`, but the value is the **infra provider key** generated above — not a regular service account key. The two are not interchangeable.
+</Info>
+
+## 2. Preparing Proxmox access
+
+For production deployments, create a dedicated Proxmox user with a least-privilege role and authenticate the provider with an API token. Password authentication is documented as an alternative in section 2.4.
+
+<Warning>
+Do not use the `root@pam` account outside of quick evaluations. The provider only needs the privileges listed below; granting it root access makes credential rotation harder and expands the blast radius of a leaked key.
+</Warning>
+
+### 2.1. Creating a dedicated role
+
+On any Proxmox node, run the following command to create an `OmniInfraProvider` role. The privileges below are the strict minimum derived from the Proxmox API calls the provider actually makes. See [troubleshooting](./troubleshooting#virtual-machine-creation-fails-with-permission-denied) for the API call ↔ privilege mapping.
+
+If the VMs will attach to SDN bridges, also include `SDN.Use` in the privilege list below.
+
+```bash
+PRIVS="Sys.Audit,VM.Allocate,VM.Audit,VM.PowerMgmt"
+PRIVS="${PRIVS},VM.Config.CPU,VM.Config.Cloudinit,VM.Config.Disk,VM.Config.HWType"
+PRIVS="${PRIVS},VM.Config.Memory,VM.Config.Network,VM.Config.Options"
+PRIVS="${PRIVS},Datastore.Allocate,Datastore.AllocateSpace,Datastore.Audit"
+
+pveum role add OmniInfraProvider --privs "${PRIVS}"
+```
+
+### 2.2. Creating a dedicated user
+
+Create a dedicated user in the `pve` realm and grant the `OmniInfraProvider` role at the root of the permission tree:
+
+```bash
+pveum user add omni-provider@pve
+pveum acl modify / --users omni-provider@pve --roles OmniInfraProvider
+```
+
+### 2.3. Generating an API token (recommended)
+
+Generate an API token for the dedicated user:
+
+```bash
+pveum user token add omni-provider@pve omni --privsep 0
+```
+
+<Warning>
+The command prints the token secret **only once**. Store it in your secret manager immediately; it cannot be retrieved again.
+</Warning>
+
+The `--privsep 0` flag disables [privilege separation](https://pve.proxmox.com/pve-docs/pveum-plain.html#_api_tokens) so the token inherits the user's role directly. This is the simplest setup and what we use in the rest of this tutorial.
+
+If your Proxmox security policy requires privilege separation, omit the flag and grant the role to the token's ACL path explicitly:
+
+```bash
+pveum acl modify / --tokens 'omni-provider@pve!omni' --roles OmniInfraProvider
+```
+
+Record the two values you will pass to the provider:
+
+* `tokenID`: `omni-provider@pve!omni`
+* `tokenSecret`: the UUID printed by the command above
+
+### 2.4. Using a password (alternative)
+
+Password authentication is available for restricted environments where API tokens are not practical. Set the password for the dedicated user created earlier:
+
+```bash
+pveum passwd omni-provider@pve
+```
+
+## 3. Writing the provider configuration file
+
+The provider reads its Proxmox connection settings from a YAML configuration file passed via `--config-file`.
+
+Substitute the following placeholders before applying the example below:
+
+* `PROXMOX_URL` — Proxmox VE API URL, ending with `/api2/json` (for example `https://pve.example.com:8006/api2/json`).
+* `PROXMOX_TOKEN_ID` — API token ID from the previous step (for example `omni-provider@pve!omni`).
+* `PROXMOX_TOKEN_SECRET` — API token secret from the same step.
+
+Create `config.yaml`:
+
+```yaml
+proxmox:
+  url: PROXMOX_URL
+  tokenID: PROXMOX_TOKEN_ID
+  tokenSecret: PROXMOX_TOKEN_SECRET
+```
+
+See the [provider configuration file reference](./reference#configuration-file) for every supported field, including password authentication and TLS options.
+
+<Warning>
+The configuration file contains secrets. Restrict its permissions (`chmod 600 config.yaml`) and store it outside any source-controlled directory. In Kubernetes deployments, mount it from a `Secret` rather than a `ConfigMap`.
+</Warning>
+
+## 4. Starting the provider
+
+The provider runs as a single container. The same image works on a dedicated VM, a bastion host, or a Kubernetes pod, as long as it has outbound reach to both the Proxmox API and the Omni API.
+
+Export the endpoint and the infra provider key generated in [step 1](#1-creating-an-omni-infra-provider):
+
+```bash
+export OMNI_ENDPOINT=https://my-instance.omni.siderolabs.io
+export OMNI_SERVICE_ACCOUNT_KEY=<infra-provider-key>
+```
+
+The three deployment tabs below (Docker run, Docker Compose, Kubernetes) all read these two variables from the current shell; keep this terminal open or re-export them before moving to another tab.
+
+<Info>
+The examples below use the `:latest` image tag because upstream does not publish versioned tags yet. For production, pin by digest:
+
+```bash
+docker pull ghcr.io/siderolabs/omni-infra-provider-proxmox:latest
+docker inspect --format='{{index .RepoDigests 0}}' \
+  ghcr.io/siderolabs/omni-infra-provider-proxmox:latest
+```
+
+Use the returned `ghcr.io/siderolabs/omni-infra-provider-proxmox@sha256:<digest>` reference in your `docker run`, Compose file, or Kubernetes manifest.
+</Info>
+
+<Tabs>
+  <Tab title="docker run">
+    Run the provider with the configuration file created in [step 3](#3-writing-the-provider-configuration-file):
+
+    ```bash
+    docker run -d --name=omni-proxmox-infra-provider \
+      --restart=always \
+      -v $(pwd)/config.yaml:/config.yaml:ro \
+      -e OMNI_ENDPOINT \
+      -e OMNI_SERVICE_ACCOUNT_KEY \
+      ghcr.io/siderolabs/omni-infra-provider-proxmox:latest \
+      --config-file /config.yaml
+    ```
+
+    The `--omni-api-endpoint` and `--omni-service-account-key` flags default to the `OMNI_ENDPOINT` and `OMNI_SERVICE_ACCOUNT_KEY` environment variables, so passing the variables via `-e` is enough.
+
+    Check the container is running:
+
+    ```bash
+    docker ps | grep omni-proxmox-infra-provider
+    ```
+
+    Tail the logs:
+
+    ```bash
+    docker logs -f omni-proxmox-infra-provider
+    ```
+  </Tab>
+
+  <Tab title="Docker Compose">
+    Create a `docker-compose.yaml` next to `config.yaml`:
+
+    ```yaml
+    services:
+      omni-infra-provider-proxmox:
+        image: ghcr.io/siderolabs/omni-infra-provider-proxmox:latest
+        container_name: omni-proxmox-infra-provider
+        restart: unless-stopped
+        volumes:
+          - ./config.yaml:/config.yaml:ro
+        environment:
+          OMNI_ENDPOINT: ${OMNI_ENDPOINT}
+          OMNI_SERVICE_ACCOUNT_KEY: ${OMNI_SERVICE_ACCOUNT_KEY}
+        command: ["--config-file", "/config.yaml"]
+    ```
+
+    Start the stack:
+
+    ```bash
+    docker compose up -d
+    ```
+
+    Tail the logs:
+
+    ```bash
+    docker compose logs -f
+    ```
+  </Tab>
+
+  <Tab title="Kubernetes">
+    Store the Proxmox configuration and the Omni key as a `Secret`:
+
+    ```bash
+    kubectl create namespace omni-infra
+    kubectl -n omni-infra create secret generic omni-proxmox-provider \
+      --from-file=config.yaml=./config.yaml \
+      --from-literal=OMNI_ENDPOINT="${OMNI_ENDPOINT}" \
+      --from-literal=OMNI_SERVICE_ACCOUNT_KEY="${OMNI_SERVICE_ACCOUNT_KEY}"
+    ```
+
+    Apply the following `Deployment`:
+
+    ```yaml
+    apiVersion: apps/v1
+    kind: Deployment
+    metadata:
+      name: omni-infra-provider-proxmox
+      namespace: omni-infra
+    spec:
+      replicas: 1
+      strategy:
+        type: Recreate
+      selector:
+        matchLabels:
+          app: omni-infra-provider-proxmox
+      template:
+        metadata:
+          labels:
+            app: omni-infra-provider-proxmox
+        spec:
+          containers:
+            - name: provider
+              image: ghcr.io/siderolabs/omni-infra-provider-proxmox:latest
+              args:
+                - --config-file=/etc/omni-proxmox/config.yaml
+              envFrom:
+                - secretRef:
+                    name: omni-proxmox-provider
+              volumeMounts:
+                - name: config
+                  mountPath: /etc/omni-proxmox
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+          volumes:
+            - name: config
+              secret:
+                secretName: omni-proxmox-provider
+                items:
+                  - key: config.yaml
+                    path: config.yaml
+    ```
+
+    <Info>
+    A single replica with the `Recreate` strategy is sufficient — the provider is stateless. Schedule it on a node that has network access to the Proxmox API.
+    </Info>
+
+    Tail the logs:
+
+    ```bash
+    kubectl -n omni-infra logs -f deploy/omni-infra-provider-proxmox
+    ```
+  </Tab>
+</Tabs>
+
+Once it connects to Omni, the provider registers itself as an infra provider (named **Proxmox** unless you overrode `--provider-name`) and is ready to accept machine requests. No inbound ports are needed — only outbound connectivity to the Proxmox API, the Omni API, and (from the Proxmox nodes) Image Factory.
+
+## 5. Creating a machine class for auto-provisioning
+
+To make the Proxmox provider create VMs, define an Omni **machine class** with an `autoProvision` spec. A machine class describes the shape of the VMs the provider must create when Omni needs capacity.
+
+Typical deployments define at least two classes: one for control-plane nodes and one for workers. Create one file per class:
+
+`proxmox-controlplane-small.yaml`:
+
+```yaml
+metadata:
+  namespace: default
+  type: MachineClasses.omni.sidero.dev
+  id: proxmox-controlplane-small
+spec:
+  autoProvision:
+    providerID: proxmox
+    providerData: |
+      cores: 2
+      memory: 4096
+      disk_size: 50
+      storage_selector: 'name == "local-lvm"'
+      network_bridge: vmbr0
+      disk_ssd: true
+      disk_discard: true
+```
+
+`proxmox-worker-medium.yaml`:
+
+```yaml
+metadata:
+  namespace: default
+  type: MachineClasses.omni.sidero.dev
+  id: proxmox-worker-medium
+spec:
+  autoProvision:
+    providerID: proxmox
+    providerData: |
+      cores: 4
+      memory: 8192
+      disk_size: 80
+      storage_selector: 'name == "local-lvm"'
+      network_bridge: vmbr0
+      disk_ssd: true
+      disk_discard: true
+      disk_iothread: true
+```
+
+The four **required** provider-data fields are `cores`, `memory`, `disk_size`, and `storage_selector`. See the [machine class schema reference](./reference#machine-class-schema) for every supported option — CPU topology, PCI pass-through, additional disks and NICs, and more.
+
+Apply both machine classes to Omni:
+
+```bash
+omnictl apply -f proxmox-controlplane-small.yaml
+omnictl apply -f proxmox-worker-medium.yaml
+```
+
+<Info>
+The `storage_selector` is a CEL expression evaluated against the available Proxmox storage pools. See [troubleshooting](./troubleshooting#storage-selector-returns-no-result) for common errors and the [reference](./reference#placement) for the full list of variables exposed to the expression.
+</Info>
+
+**Common `storage_selector` patterns**:
+
+| Intent                                                 | Expression                                                                         |
+|:-------------------------------------------------------|:-----------------------------------------------------------------------------------|
+| Use `local-lvm` by name                                | `name == "local-lvm"`                                                              |
+| Use a Ceph RBD pool by name                            | `name == "ceph-vm"`                                                                |
+| Pick any ZFS pool                                      | `storageType == "zfspool"`                                                         |
+| Require a specific storage with at least 100 GiB free  | `name == "fast-ssd" && availableSpace > 100 * 1024 * 1024 * 1024`                  |
+
+<Warning>Syntax errors and over-broad matches (more than one storage) only surface at VM creation time, not when applying the machine class.</Warning>
+
+## 6. Validating the setup
+
+Before running production workloads, validate the provider end-to-end with a small test cluster.
+
+1. In the Omni web UI, create a new cluster with:
+   * 1 control-plane machine drawn from the `proxmox-controlplane-small` class
+   * 1 worker machine drawn from the `proxmox-worker-medium` class
+
+2. Watch the provider logs while Omni requests the machines:
+
+   ```bash
+   docker logs -f omni-proxmox-infra-provider
+   ```
+
+   The provider emits structured log entries for each step of the VM lifecycle (node selection, ISO download, VM creation, cloud-init injection, power on). The exact wording depends on the provider version — rely on the presence of entries rather than matching specific strings.
+
+3. Confirm the VMs appear in Proxmox and that Omni sees them:
+
+   ```bash
+   # On any Proxmox node
+   qm list
+
+   # From your workstation
+   omnictl get link
+   omnictl get inframachine
+   ```
+
+4. Wait for the cluster to reach `Ready` in the Omni UI. Expect 3 to 8 minutes for a two-node cluster, depending on the Talos ISO download time and Proxmox node performance.
+
+5. Delete the cluster, either from the Omni UI (**Clusters** > your cluster > **Destroy**) or with `omnictl`:
+
+   ```bash
+   omnictl delete cluster <cluster-id>
+   ```
+
+6. Confirm the removal on both sides:
+   * `qm list` on the Proxmox node no longer shows the VMs.
+   * The provider logs record a stop and a delete for each VMID.
+
+If any step fails, see the [troubleshooting page](./troubleshooting).
+
+## Operational notes
+
+* **Multiple Proxmox clusters**: run one provider per Proxmox cluster (or per credential scope) and give each one a distinct `--id`. Each appears as its own infra provider in Omni.
+* **ISO cache**: cached Talos ISOs on Proxmox accumulate over time. A new ISO is downloaded each time the schematic or Talos version changes and the provider never removes them. Clean obsolete ISOs from the Proxmox storage during maintenance windows.
+
+For operational issues, see the [troubleshooting page](./troubleshooting). For the exhaustive list of CLI flags, configuration fields, and machine class schema, see the [reference](./reference).

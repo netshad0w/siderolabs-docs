@@ -2661,6 +2661,15 @@
               "omni/omni-cluster-setup/create-an-omni-service-account",
               "omni/omni-cluster-setup/how-to-set-initial-machine-labels",
               "omni/omni-cluster-setup/setting-up-the-bare-metal-infrastructure-provider",
+              {
+                "group": "Setting Up the Proxmox Infrastructure Provider",
+                "pages": [
+                  "omni/omni-cluster-setup/proxmox-provider/overview",
+                  "omni/omni-cluster-setup/proxmox-provider/setup",
+                  "omni/omni-cluster-setup/proxmox-provider/reference",
+                  "omni/omni-cluster-setup/proxmox-provider/troubleshooting"
+                ]
+              },
               "omni/omni-cluster-setup/omni-firewall-egress-requirement"
             ]
           },

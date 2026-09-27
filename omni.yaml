@@ -63,6 +63,12 @@ navigation:
             - "create-an-omni-service-account.mdx"
             - "how-to-set-initial-machine-labels.mdx"
             - "setting-up-the-bare-metal-infrastructure-provider.mdx"
+            - group: "Setting Up the Proxmox Infrastructure Provider"
+              pages:
+                - "proxmox-provider/overview"
+                - "proxmox-provider/setup"
+                - "proxmox-provider/reference"
+                - "proxmox-provider/troubleshooting"
             - "omni-firewall-egress-requirement.mdx"
         - group: "Cluster Management"
           folder: "omni/cluster-management"

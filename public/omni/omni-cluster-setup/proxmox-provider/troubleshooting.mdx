@@ -1,0 +1,276 @@
+---
+title: Troubleshooting
+description: Diagnose and fix common issues with the Proxmox Infrastructure Provider — authentication, storage selection, VM lifecycle, SideroLink, and Image Factory problems.
+---
+
+This page lists the issues most commonly hit when running the Proxmox Infrastructure Provider, with diagnosis steps and fixes. For the full list of CLI flags, configuration fields, and machine class schema, see the [reference](./reference).
+
+## The provider doesn't appear in Omni
+
+The provider container is running but no entry shows up under **Settings** > **Infra Providers** in Omni.
+
+**Diagnosis**
+
+```bash
+docker logs -f omni-proxmox-infra-provider
+```
+
+Look for authentication errors from the Omni API.
+
+**Common causes and fixes**
+
+* **Wrong key type.** The value passed via `OMNI_SERVICE_ACCOUNT_KEY` must be an **infra provider key** produced by the **Settings** > **Infra Providers** flow (or `omnictl infraprovider create`). A regular Omni service account key is not accepted. Re-issue the key and restart the container.
+* **ID mismatch.** The provider ID (default `proxmox`, set via `--id`) must match the ID of the Omni infra provider resource. If you changed one, change both.
+* **Provider exited at startup.** The provider validates its flags and configuration file before connecting to Omni. Two specific messages to look for:
+  * `omni-api-endpoint flag is not set` — the endpoint was not provided via `--omni-api-endpoint` or `OMNI_ENDPOINT`.
+  * `failed to read Proxmox config file` — the `--config-file` path is not readable from inside the container (bind mount or filesystem permissions).
+
+## Proxmox authentication fails
+
+The provider logs show `401 Unauthorized` or `403 Forbidden` responses from the Proxmox API.
+
+**Diagnosis**
+
+Test the token manually from the host running the provider:
+
+```bash
+curl -k -H "Authorization: PVEAPIToken=omni-provider@pve!omni=<TOKEN_SECRET>" \
+  https://pve.example.com:8006/api2/json/version
+```
+
+Expected: a JSON response with `data.version`.
+
+**Common causes and fixes**
+
+* **Wrong token format.** The `tokenID` must include the realm and the token name separated by `!`, for example `omni-provider@pve!omni`.
+* **Missing privileges on the token.** Tokens created with privilege separation (`--privsep 1`, the Proxmox default) must have the role assigned to them explicitly. Two options:
+  1. Grant the role on the token's ACL path:
+     ```bash
+     pveum acl modify / --tokens 'omni-provider@pve!omni' --roles OmniInfraProvider
+     ```
+  2. As a last resort, re-issue the token with `--privsep 0` so it inherits the user's role.
+* **Mixed credentials.** If both `username`/`password` and `tokenID`/`tokenSecret` are present in `config.yaml`, the provider uses the password pair. Remove whichever you do not intend to use.
+
+## Virtual machine creation fails with permission denied
+
+A machine request starts but the provider logs show `permission denied` or `403` errors during `POST /nodes/{node}/qemu` or related calls.
+
+**Diagnosis**
+
+Inspect the effective ACLs for the provider user:
+
+```bash
+pveum user permissions omni-provider@pve --path /
+```
+
+Cross-reference with the table of required privileges below.
+
+**Required privileges by API call**
+
+The `OmniInfraProvider` role created in the [setup tutorial](./setup) grants exactly this set.
+
+| API call                                                                     | Operation                                        | Proxmox privilege                               |
+|:-----------------------------------------------------------------------------|:-------------------------------------------------|:------------------------------------------------|
+| `GET /nodes`                                                                 | List cluster nodes                               | `Sys.Audit`                                     |
+| `GET /nodes/{node}`                                                          | Read node status                                 | `Sys.Audit`                                     |
+| `GET /nodes/{node}/storage`                                                  | Enumerate storage pools                          | `Datastore.Audit`                               |
+| `GET /nodes/{node}/storage/{storage}/content`                                | Look up cached Talos ISOs                        | `Datastore.Allocate`                            |
+| `POST /nodes/{node}/storage/{storage}/download-url`                          | Download a Talos ISO from Image Factory          | `Datastore.AllocateSpace`                       |
+| `GET /cluster/nextid`                                                        | Allocate a fresh VMID                            | `Sys.Audit`                                     |
+| `POST /nodes/{node}/qemu`                                                    | Create a new VM                                  | `VM.Allocate` and `VM.Config.*` (see below)     |
+| `POST /nodes/{node}/qemu/{vmid}/config`                                      | Inject the cloud-init snippet                    | `VM.Config.Cloudinit`                           |
+| `POST /nodes/{node}/qemu/{vmid}/status/start`                                | Start the VM                                     | `VM.PowerMgmt`                                  |
+| `POST /nodes/{node}/qemu/{vmid}/status/stop`                                 | Stop the VM on removal                           | `VM.PowerMgmt`                                  |
+| `DELETE /nodes/{node}/qemu/{vmid}`                                           | Delete the VM on removal                         | `VM.Allocate`                                   |
+| `GET /nodes/{node}/qemu`, `GET /nodes/{node}/qemu/{vmid}/config`             | List and read VMs                                | `VM.Audit`                                      |
+| `GET /nodes/{node}/tasks/{upid}/status`                                      | Poll the status of an asynchronous task          | `Sys.Audit`                                     |
+
+`VM.Config.*` expands to: `VM.Config.CPU`, `VM.Config.Disk`, `VM.Config.HWType`, `VM.Config.Memory`, `VM.Config.Network`, and `VM.Config.Options` (plus `VM.Config.Cloudinit` for the cloud-init injection step). `VM.Clone`, `VM.Migrate`, and `Pool.Allocate` are not used. Add `SDN.Use` only if your VMs attach to SDN bridges.
+
+**Common causes and fixes**
+
+* **Role missing privileges.** The `OmniInfraProvider` role must grant the full set documented in the reference. Re-run `pveum role modify OmniInfraProvider --privs "..."` if any are missing.
+* **ACL on a narrower path.** Grant the role on `/`: `pveum acl modify / --users omni-provider@pve --roles OmniInfraProvider`. Narrower paths miss cluster-wide calls such as `GET /cluster/nextid`.
+* **SDN bridge.** Add `SDN.Use` to the role when VMs attach to an SDN bridge.
+
+## Storage selector returns no result
+
+The `syncVM` step fails with `storage selector did not match any storage` or similar.
+
+**Diagnosis**
+
+List the storage pools available on the chosen node:
+
+```bash
+pvesh get /nodes/<node>/storage --output-format yaml
+```
+
+Check that the CEL expression in `providerData.storage_selector` matches **exactly one** entry.
+
+**Common causes and fixes**
+
+* **Content mismatch.** A storage must expose `images` content to host VM disks. `pvesh get /nodes/<node>/storage` shows `content` per storage; adjust the selector if you accidentally pick an ISO-only or backup-only pool.
+* **Node scope.** Storage pools can be node-scoped. If the provider auto-selects a node without the expected storage, pin the class with `node: <name>` or configure the storage on all nodes.
+* **Typo in CEL.** The expression is matched at VM creation time, not at apply time. Common mistakes: single `=` instead of `==` (invalid CEL), or referencing a field that does not exist. Only `name`, `node`, `storageType`, and `availableSpace` are exposed — see the [variables list](./reference#placement).
+* **Overmatch.** If the selector matches more than one storage, it also fails. Tighten the expression with extra conditions.
+
+## VMs boot but never join the cluster
+
+The provider creates the VM and powers it on, but Omni never sees a corresponding `Link` or `InfraMachine`.
+
+**Diagnosis**
+
+Find the VMID of the stuck machine — either from the provider logs (`docker logs … | grep -i vmid`) or by listing VMs with the provider's tag:
+
+```bash
+pvesh get /cluster/resources --type vm --output-format json \
+  | jq -r '.[] | select((.tags // "") | contains("machine-request.")) | "\(.node)\t\(.vmid)"'
+```
+
+Then confirm the VM has the cloud-init disk attached and the correct SMBIOS UUID:
+
+```bash
+qm config <vmid> | grep -E 'ide0|smbios1'
+```
+
+Expected:
+
+* `ide0:` pointing to a cloud-init image on the selected storage.
+* `smbios1: uuid=<random-uuid>` (the value SideroLink uses to identify the machine).
+
+Check that the VM can reach the Omni instance on the SideroLink WireGuard port (UDP 51820 by default). If the provider runs in gRPC tunnel mode, check the gRPC endpoint instead.
+
+**Common causes and fixes**
+
+* **Cloud-init snippet absent.** If `ide0` is not attached, the `startVM` step never completed. Check the provider logs for an error on that step, delete the VM manually, and let Omni re-request the machine.
+* **SMBIOS UUID absent or unexpected.** Omni uses the SMBIOS UUID to identify the machine; if `smbios1:` is missing, the VM was created outside of the provider's flow and Omni cannot track it.
+* **Proxmox firewall on `net0` blocks SideroLink.** The provider hardcodes `firewall=1` on the primary NIC (see [Fixed VM settings](./overview#fixed-vm-settings) in the overview). If your cluster-level or datacenter firewall rules drop outbound traffic from VMs, SideroLink cannot reach Omni. Allow outbound UDP 51820 (SideroLink) and TCP 443 (Omni API and Image Factory).
+
+## Talos image download stuck
+
+The `uploadISO` step stays in progress for minutes or fails.
+
+**Diagnosis**
+
+Inspect the Proxmox task from the node that attempted the download:
+
+```bash
+pvesh get /nodes/<node>/tasks --source all | grep download-url
+```
+
+Open the task log:
+
+```bash
+pvesh get /nodes/<node>/tasks/<upid>/log
+```
+
+**Common causes and fixes**
+
+* **No outbound access from Proxmox.** The download happens from the Proxmox node, not from the provider container. Ensure the node has outbound HTTPS access to `factory.talos.dev` (or your self-hosted Image Factory).
+* **Corrupt cached ISO.** Find the cached file and remove it to force a re-download. Replace `<node>`, `<storage>`, and `<sha256>` with your values:
+
+  ```bash
+  # List ISOs on the storage to find the volume ID
+  pvesh get /nodes/<node>/storage/<storage>/content --content iso
+  ```
+
+  <Warning>
+  The next command permanently deletes a storage volume. Confirm the volume ID before running it.
+  </Warning>
+
+  ```bash
+  # Delete the corrupt ISO by volume ID
+  pvesh delete /nodes/<node>/storage/<storage>/content/<storage>:iso/<sha256>.iso
+  ```
+* **Storage out of space.** `pvesm status` shows usage per storage. Free space or switch the ISO storage.
+
+## Orphan VMs after a provider crash
+
+A provider restart leaves VMs running on Proxmox that Omni no longer tracks.
+
+**Diagnosis**
+
+Orphan VMs created by the provider carry a tag of the form `machine-request.<id>`. List them cluster-wide via the cluster resources API:
+
+```bash
+pvesh get /cluster/resources --type vm --output-format json \
+  | jq -r '.[] | select((.tags // "") | contains("machine-request.")) | "\(.node)\t\(.vmid)\t\(.tags)"'
+```
+
+Cross-reference the VMID values with the `InfraMachine` resources in Omni:
+
+```bash
+omnictl get inframachine
+```
+
+**Fix**
+
+For each orphan, stop and delete the VM manually on the node it lives on.
+
+<Warning>
+`qm destroy --purge` permanently deletes the VM, all its disks, and any associated replication and HA state. Confirm the VMID is an orphan before running it.
+</Warning>
+
+```bash
+qm stop <vmid>
+qm destroy <vmid> --purge 1
+```
+
+## Machine requests stall after renaming the provider `--id`
+
+Renaming `--id` after Omni already knows a provider with the old ID leaves the old infra provider resource orphaned. New machine requests against the old ID stall; the new ID never matches existing machine classes.
+
+**Fix**
+
+1. Decide which ID is canonical. If you are renaming, plan for a short downtime.
+2. Remove the old infra provider resource in Omni (**Settings** > **Infra Providers** > delete), or via `omnictl delete infraprovider <old-id>`.
+3. Update any machine classes that referenced the old `providerID`. List candidates with:
+   ```bash
+   omnictl get machineclasses -o yaml | grep -E 'id:|providerID:'
+   ```
+   Edit each affected class from the Omni UI (**Machines** > **Machine Classes**) or with `omnictl apply -f`.
+4. Restart the provider with the new `--id`.
+
+## Cluster never reaches Ready after VMs are created
+
+VMs are provisioned on Proxmox and register with Omni, but the cluster stays stuck before `Ready`.
+
+**Diagnosis**
+
+In the Omni UI, open the machine details and check the SideroLink status.
+
+**Common causes and fixes**
+
+* **Guest network not up.** The `qemu-guest-agent` Talos extension is injected automatically but requires the VM's network to be up to report back. Check that `net0`'s VLAN and bridge resolve correctly from inside Proxmox: `qm guest cmd <vmid> network-get-interfaces`.
+* **Proxmox API certificate expired.** The provider calls the Proxmox API (including the `download-url` endpoint used for the Talos ISO) over TLS, so an expired PVE certificate breaks machine provisioning. Check with `pvenode cert info` and renew via the Proxmox UI.
+
+## Machine requests go to the wrong Proxmox cluster
+
+When more than one Proxmox cluster sits behind the same Omni instance, a mismatched ID causes requests to land on the wrong cluster or stall.
+
+**Rules for multi-cluster deployments**
+
+* Give each provider a **unique `--id`** (for example `proxmox-dc1`, `proxmox-dc2`).
+* Create **one Omni infra provider** per ID (**Settings** > **Infra Providers**) and pass the corresponding key.
+* Use **one configuration file per cluster** with the cluster-specific URL and credentials.
+* In each machine class, set `providerID` to match the `--id` of the target cluster.
+
+## What a healthy run looks like
+
+During a successful machine request, the provider emits one structured log entry per lifecycle step, in this order:
+
+1. Connection to Omni established.
+2. Proxmox node selection.
+3. Image Factory schematic generation.
+4. Talos ISO download, or cache hit, on the Proxmox storage.
+5. VM creation on Proxmox (with a `vmid`).
+6. Cloud-init injection on the VM's `ide0` device.
+7. VM power-on.
+
+On removal, two entries are expected: stop and delete, both referencing the same `vmid`.
+
+Compare your logs against this sequence. Missing steps point to the matching symptom above — for example, no entry at step 4 means the ISO download is stuck. Repeated reconnection attempts against the Omni endpoint (instead of a single connect entry at startup) indicate a stale infra provider key or an `--id` mismatch with the Omni-side infra provider.
+
+<Info>
+The exact wording of each log entry may change between provider versions. Rely on the presence of entries in this order, not on matching specific strings.
+</Info>

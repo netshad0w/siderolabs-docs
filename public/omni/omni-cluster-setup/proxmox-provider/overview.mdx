@@ -1,0 +1,53 @@
+---
+title: Overview
+description: Overview of the Proxmox Infrastructure Provider — what it does, how it provisions Talos VMs on a Proxmox VE cluster, and where to go next.
+---
+
+The [Proxmox Infrastructure Provider](https://github.com/siderolabs/omni-infra-provider-proxmox) lets Omni create and destroy Talos Linux VMs on a Proxmox VE cluster on demand. It is a **dynamic** provider — see the [Infrastructure Providers overview](../../infrastructure-and-extensions/infrastructure-providers) for the difference between static and dynamic providers.
+
+## How it works
+
+The provider runs as a single stateless container that talks to both the Omni API and the Proxmox VE API. All lifecycle state lives on the Omni side; the container can be restarted or moved without disrupting existing VMs.
+
+When Omni requests a machine, the provider:
+
+1. Picks a Proxmox node — pinned via the machine class, or [auto-selected](#node-selection).
+2. Asks Omni for an Image Factory schematic and downloads the matching Talos ISO to a Proxmox ISO storage, keyed by the download URL's SHA256.
+3. Creates a VM with a random SMBIOS UUID that Omni uses to identify the machine.
+4. Injects a cloud-init snippet on `ide0` containing the Talos join configuration, then powers the VM on.
+
+When Omni removes a machine, the provider stops and deletes the VM along with its disks, network interfaces, and PCI bindings.
+
+<Info>
+Cached Talos ISOs are never garbage-collected by the provider. A new ISO is downloaded each time the schematic or Talos version changes, and every one of them stays on the Proxmox storage until you delete it by hand.
+</Info>
+
+### Node selection
+
+When the machine class does not set `node`, the provider picks a node by:
+
+1. **Fewest VMs in the same `MachineRequestSet`** — distributes VMs of a single cluster across nodes. Only applies inside a `MachineRequestSet`; otherwise memory ratio alone decides.
+2. **Highest free-memory ratio** — computed as `(MaxMem - Mem) / MaxMem`, not absolute free memory.
+
+CPU load and free disk space are not considered.
+
+### Fixed VM settings
+
+The provider hardcodes the following Proxmox options on every VM it creates. They are not configurable through the machine class.
+
+| Option                 | Value                   | Rationale                                                                                                        |
+|:-----------------------|:------------------------|:-----------------------------------------------------------------------------------------------------------------|
+| `scsihw`               | `virtio-scsi-single`    | Dedicated queue per disk for better throughput.                                                                  |
+| `onboot`               | `1`                     | VMs restart when the Proxmox node reboots.                                                                       |
+| `agent`                | `enabled=true`          | The `siderolabs/qemu-guest-agent` Talos extension is always injected into the schematic.                         |
+| Primary NIC `firewall` | `1`                     | The Proxmox firewall is always enabled on `net0`.                                                                |
+
+## Requirements at a glance
+
+You need an Omni instance, a Proxmox VE cluster with outbound access to [Image Factory](https://factory.talos.dev), and Proxmox credentials (API token recommended). The provider itself runs as a container on any Docker or Kubernetes host. The [setup tutorial](./setup) lists the exact prerequisites.
+
+## Where to go next
+
+* **[Setup](./setup)** — step-by-step deployment, from the Omni service account to a validation cluster.
+* **[Reference](./reference)** — CLI flags, configuration fields, machine class schema, Proxmox privileges, and VM lifecycle.
+* **[Troubleshooting](./troubleshooting)** — diagnosis and fixes for common issues.
